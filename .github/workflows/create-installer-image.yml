@@ -1,0 +1,39 @@
+name: Create Installer Image
+
+jobs:
+  create-installer-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cache rootfs
+        id: cache-rootfs
+        uses: actions/cache@v3
+        with:
+          path: rootfs.img
+          key: ubuntu-mate-22.04-desktop-armhf+raspi
+      - if: ${{ steps.cache-rootfs.outputs.cache-hit != 'true' }}
+        name: download rootfs image
+        run: |
+          wget http://localhost:8000/ubuntu-mate-22.04-desktop-armhf+raspi.img -O rootfs.img
+          #wget https://releases.ubuntu-mate.org/22.04/armhf/ubuntu-mate-22.04-desktop-armhf+raspi.img.xz -O rootfs.img.xz
+          #unxz rootfs.img.xz # -> rootfs.img
+      - name: Checkout kernel source
+        uses: actions/checkout@v3
+      - name: bootstrap
+        run: |
+          apt update
+          apt install python3-pip -y
+          wget https://ubuntu-mate.org/images/get-involved/logo-guidelines/Main_Logo.png -O logo.png
+          pip3 install pmbootstrap
+          pmbootstrap -c .github/workflows/pmbootstrap.cfg --as-root -y init
+          pmbootstrap --details-to-stdout install --ondev --no-rootfs --cp \
+          rootfs.img:/var/lib/rootfs.img \
+          #.github/workflows/mobile.conf:/etc/calamares/modules/mobile.conf \
+          #.github/workflows/shellprocess.conf:/etc/calamares/modules/shellprocess.conf \
+          #logo.png:/usr/share/calamares/branding/default-mobile/logo.png
+      - name: Build custom kernel
+        run: |
+          sudo apt update
+          sudo apt install build-essential gcc-arm-linux-gnueabihf libncurses-dev flex bison libssl-dev bc libelf-dev libudev-dev -y
+          ARCH=arm make ARCH=arm tegra_defconfig
+          ARCH=arm make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j $(nproc)
+      
