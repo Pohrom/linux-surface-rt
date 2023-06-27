@@ -1,39 +1,106 @@
 name: Create Installer Image
 
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
 jobs:
   create-installer-image:
     runs-on: ubuntu-latest
     steps:
-      - name: cache rootfs
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Check cached rootfs
         id: cache-rootfs
         uses: actions/cache@v3
         with:
-          path: rootfs.img
+          path: ~/rootfs.img
           key: ubuntu-mate-22.04-desktop-armhf+raspi
-      - if: ${{ steps.cache-rootfs.outputs.cache-hit != 'true' }}
-        name: download rootfs image
+
+      - name: Download rootfs image
+        if: ${{ steps.cache-rootfs.outputs.cache-hit != 'true' }}
         run: |
-          wget http://localhost:8000/ubuntu-mate-22.04-desktop-armhf+raspi.img -O rootfs.img
-          #wget https://releases.ubuntu-mate.org/22.04/armhf/ubuntu-mate-22.04-desktop-armhf+raspi.img.xz -O rootfs.img.xz
-          #unxz rootfs.img.xz # -> rootfs.img
+          #wget http://localhost:8000/ubuntu-mate-22.04-desktop-armhf+raspi.img -O ~/rootfs.img
+          wget https://releases.ubuntu-mate.org/22.04/armhf/ubuntu-mate-22.04-desktop-armhf+raspi.img.xz -O ~/rootfs.img.xz
+          unxz ~/rootfs.img.xz
+          true || rm -rf ~/rootfs.img.xz
+
       - name: Checkout kernel source
-        uses: actions/checkout@v3
-      - name: bootstrap
-        run: |
-          apt update
-          apt install python3-pip -y
-          wget https://ubuntu-mate.org/images/get-involved/logo-guidelines/Main_Logo.png -O logo.png
-          pip3 install pmbootstrap
-          pmbootstrap -c .github/workflows/pmbootstrap.cfg --as-root -y init
-          pmbootstrap --details-to-stdout install --ondev --no-rootfs --cp \
-          rootfs.img:/var/lib/rootfs.img \
-          #.github/workflows/mobile.conf:/etc/calamares/modules/mobile.conf \
-          #.github/workflows/shellprocess.conf:/etc/calamares/modules/shellprocess.conf \
-          #logo.png:/usr/share/calamares/branding/default-mobile/logo.png
+        uses: actions/checkout@v3  
+
+      - name: Load ccache
+        uses: actions/cache@v3
+        with:
+          path: ~/.ccache
+          key: kernel-build
+
       - name: Build custom kernel
         run: |
           sudo apt update
-          sudo apt install build-essential gcc-arm-linux-gnueabihf libncurses-dev flex bison libssl-dev bc libelf-dev libudev-dev -y
-          ARCH=arm make ARCH=arm tegra_defconfig
-          ARCH=arm make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j $(nproc)
-      
+          sudo apt install build-essential gcc-arm-linux-gnueabihf ccache libncurses-dev flex bison libssl-dev bc libelf-dev libudev-dev -y
+          mkdir -p ~/.ccache
+          ccache -z
+          ARCH=arm make ARCH=arm CC="ccache arm-linux-gnueabihf-gcc" CXX="ccache arm-linux-gnueabihf-g++" tegra_defconfig
+          cat .github/workflows/tegra_surface_rt_defconfig >> .config
+          ARCH=arm yes '' | make ARCH=arm CC="ccache arm-linux-gnueabihf-gcc" CXX="ccache arm-linux-gnueabihf-g++" CROSS_COMPILE=arm-linux-gnueabihf- -j $(nproc)
+
+      - name: Ccache statistics
+        run: |
+          ccache -s
+  
+      - name: Download grub files
+        run: | 
+          wget https://github.com/makuhlmann/grub-2.04-nokeymod/releases/download/v1-nokeymod/grub.efi -O ~/grub.efi
+          wget https://github.com/makuhlmann/grub-2.04-nokeymod/releases/download/v1-nokeymod/unicode.pf2 -O ~/unicode.pf2
+
+      - name: Patch boot+rootfs image
+        run: |
+          # mount
+          LOOPDEV="$(sudo losetup -P --show -f ~/rootfs.img)"
+          sudo mkdir -p /mnt/boot /mnt/rootfs
+          sudo mount "${LOOPDEV}p1" /mnt/boot
+          sudo mount "${LOOPDEV}p2" /mnt/rootfs
+
+          # copy files
+          sudo mkdir -p /mnt/boot/efi/boot
+          sudo cp ~/grub.efi /mnt/boot/efi/boot/bootarm.efi
+          sudo cp ~/unicode.pf2 /mnt/boot
+          sudo cp .github/workflows/grub.cfg /mnt/boot
+          sudo cp arch/arm/boot/zImage /mnt/boot
+          sudo cp arch/arm/boot/dts/tegra30-microsoft-surface-rt-efi.dts /mnt/boot
+          sudo ARCH=arm make INSTALL_MOD_PATH=/mnt/rootfs modules_install
+
+          sudo umount /mnt/boot /mnt/rootfs
+          sudo losetup --detach "${LOOPDEV}"
+
+      - name: Create installer image
+        run: |
+          sudo apt update
+          sudo apt install python3-pip -y
+          sudo pip3 install pmbootstrap
+          wget https://ubuntu-mate.org/images/get-involved/logo-guidelines/Main_Logo.png -O ~/logo.png
+          # -as-root for local debug
+          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap init
+          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap install \
+          --no-base --no-recommends --ondev --no-rootfs --cp \
+          ~/logo.png:/usr/share/calamares/branding/default-mobile/logo.png \
+          ~/rootfs.img:/var/lib/rootfs.img \
+          .github/workflows/mobile.conf:/etc/calamares/modules/mobile.conf \
+          .github/workflows/shellprocess.conf:/etc/calamares/modules/shellprocess.conf
+          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap export
+          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap shutdown
+          echo exported files:
+          ls -lha /tmp/postmarketOS-export/
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            /tmp/postmarketOS-export/microsoft-surface-rt.img
