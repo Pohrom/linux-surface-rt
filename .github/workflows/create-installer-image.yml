@@ -50,10 +50,17 @@ jobs:
           cat .github/workflows/tegra_surface_rt_defconfig >> .config
           ARCH=arm yes '' | make ARCH=arm CC="ccache arm-linux-gnueabihf-gcc" CXX="ccache arm-linux-gnueabihf-g++" CROSS_COMPILE=arm-linux-gnueabihf- -j $(nproc)
 
-      - name: Ccache statistics
+      - name: ccache statistics
         run: |
           ccache -s
-  
+
+      - name: Save ccache
+        uses: actions/cache/save@v3
+        id: cache
+        with:
+          path: ~/.ccache
+          key: kernel-build
+
       - name: Download grub files
         run: | 
           wget https://github.com/makuhlmann/grub-2.04-nokeymod/releases/download/v1-nokeymod/grub.efi -O ~/grub.efi
@@ -77,6 +84,7 @@ jobs:
           sudo ARCH=arm make INSTALL_MOD_PATH=/mnt/rootfs modules_install
 
           sudo umount /mnt/boot /mnt/rootfs
+          sudo resize2fs -fM "${LOOPDEV}p2"
           sudo losetup --detach "${LOOPDEV}"
 
       - name: Create installer image
@@ -85,7 +93,12 @@ jobs:
           sudo apt install python3-pip -y
           sudo pip3 install pmbootstrap
           wget https://ubuntu-mate.org/images/get-involved/logo-guidelines/Main_Logo.png -O ~/logo.png
-          # -as-root for local debug
+
+          # dont reserve space for sdcard install
+          WHO_RESERVE="$(pip show -f pmbootstrap | awk '/^Location: / { print $2 }')/pmb/install/_install.py"
+          echo "$WHO_RESERVE"
+          sudo sed -i "s/size_reserve =/size_reserve = 1 #/g" "$WHO_RESERVE"
+
           yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap init
           yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap install \
           --no-base --no-recommends --ondev --no-rootfs --cp \
@@ -93,7 +106,14 @@ jobs:
           ~/rootfs.img:/var/lib/rootfs.img \
           .github/workflows/mobile.conf:/etc/calamares/modules/mobile.conf \
           .github/workflows/shellprocess.conf:/etc/calamares/modules/shellprocess.conf
+
           pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap export
+  
+          mv /tmp/postmarketOS-export/microsoft-surface-rt.img /tmp/postmarketOS-export/ubuntu-mate-22.04-desktop-armhf+raspi+srt.img
+          gzip -f /tmp/postmarketOS-export/ubuntu-mate-22.04-desktop-armhf+raspi+srt.img # -f follow symbol link	
+          split -b 2000m /tmp/postmarketOS-export/ubuntu-mate-22.04-desktop-armhf+raspi+srt.img.gz /tmp/postmarketOS-export/ubuntu-mate-22.04-desktop-armhf+raspi+srt.img.gz.
+
+          # shutdown later to avoid permission issues
           pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap shutdown
           echo exported files:
           ls -lha /tmp/postmarketOS-export/
@@ -103,4 +123,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            /tmp/postmarketOS-export/microsoft-surface-rt.img
+            /tmp/postmarketOS-export/ubuntu-mate-22.04-desktop-armhf+raspi+srt.img.gz.*
