@@ -18,18 +18,24 @@ jobs:
 
       - name: Check cached rootfs
         id: cache-rootfs
-        uses: actions/cache@v3
+        uses: actions/cache/restore@v3
         with:
           path: ~/rootfs.img
-          key: ubuntu-mate-22.04-desktop-armhf+raspi
+          key: raspi_1_bullseye.img
 
       - name: Download rootfs image
         if: ${{ steps.cache-rootfs.outputs.cache-hit != 'true' }}
         run: |
-          #wget http://localhost:8000/ubuntu-mate-22.04-desktop-armhf+raspi.img -O ~/rootfs.img
-          wget https://releases.ubuntu-mate.org/22.04/armhf/ubuntu-mate-22.04-desktop-armhf+raspi.img.xz -O ~/rootfs.img.xz
+          #wget http://localhost:8000/raspi_1_bullseye.img -O ~/rootfs.img
+          wget https://raspi.debian.net/daily/raspi_1_bullseye.img.xz -O ~/rootfs.img.xz
           unxz ~/rootfs.img.xz
           true || rm -rf ~/rootfs.img.xz
+
+      - name: Save rootfs cache
+        uses: actions/cache/save@v3
+        with:
+          path: ~/rootfs.img
+          key: raspi_1_bullseye.img
 
       - name: Checkout kernel source
         uses: actions/checkout@v3  
@@ -50,10 +56,17 @@ jobs:
           cat .github/workflows/tegra_surface_rt_defconfig >> .config
           ARCH=arm yes '' | make ARCH=arm CC="ccache arm-linux-gnueabihf-gcc" CXX="ccache arm-linux-gnueabihf-g++" CROSS_COMPILE=arm-linux-gnueabihf- -j $(nproc)
 
-      - name: Ccache statistics
+      - name: ccache statistics
         run: |
           ccache -s
-  
+
+      - name: Save ccache
+        uses: actions/cache/save@v3
+        id: cache
+        with:
+          path: ~/.ccache
+          key: kernel-build
+
       - name: Download grub files
         run: | 
           wget https://github.com/makuhlmann/grub-2.04-nokeymod/releases/download/v1-nokeymod/grub.efi -O ~/grub.efi
@@ -61,8 +74,16 @@ jobs:
 
       - name: Patch boot+rootfs image
         run: |
+          # (Optional) expand rootfs for kmod
+          sudo apt update
+          sudo apt install parted -y
+          dd if=/dev/zero bs=1MiB of=~/rootfs.img conv=notrunc oflag=append count=500
+
           # mount
           LOOPDEV="$(sudo losetup -P --show -f ~/rootfs.img)"
+          sudo parted "${LOOPDEV}" resizepart 2 100%
+          sudo resize2fs -f "${LOOPDEV}p2"
+
           sudo mkdir -p /mnt/boot /mnt/rootfs
           sudo mount "${LOOPDEV}p1" /mnt/boot
           sudo mount "${LOOPDEV}p2" /mnt/rootfs
@@ -73,10 +94,11 @@ jobs:
           sudo cp ~/unicode.pf2 /mnt/boot
           sudo cp .github/workflows/grub.cfg /mnt/boot
           sudo cp arch/arm/boot/zImage /mnt/boot
-          sudo cp arch/arm/boot/dts/tegra30-microsoft-surface-rt-efi.dts /mnt/boot
+          sudo cp arch/arm/boot/dts/tegra30-microsoft-surface-rt-efi.dtb /mnt/boot
           sudo ARCH=arm make INSTALL_MOD_PATH=/mnt/rootfs modules_install
 
           sudo umount /mnt/boot /mnt/rootfs
+          sudo resize2fs -fM "${LOOPDEV}p2"
           sudo losetup --detach "${LOOPDEV}"
 
       - name: Create installer image
@@ -84,17 +106,29 @@ jobs:
           sudo apt update
           sudo apt install python3-pip -y
           sudo pip3 install pmbootstrap
-          wget https://ubuntu-mate.org/images/get-involved/logo-guidelines/Main_Logo.png -O ~/logo.png
-          # -as-root for local debug
-          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap init
-          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap install \
+          wget https://www.debian.org/Pics/debian-logo-1024x576.png -O ~/logo.png
+
+          # hack: dont reserve space for sdcard install
+          WHO_RESERVE="$(pip show -f pmbootstrap | awk '/^Location: / { print $2 }')/pmb/install/_install.py"
+          echo "$WHO_RESERVE"
+          sudo sed -i "s/size_reserve =/size_reserve = 1 #/g" "$WHO_RESERVE"
+
+          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout init
+          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout install \
           --no-base --no-recommends --ondev --no-rootfs --cp \
           ~/logo.png:/usr/share/calamares/branding/default-mobile/logo.png \
           ~/rootfs.img:/var/lib/rootfs.img \
           .github/workflows/mobile.conf:/etc/calamares/modules/mobile.conf \
           .github/workflows/shellprocess.conf:/etc/calamares/modules/shellprocess.conf
-          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap export
-          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap shutdown
+
+          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout export
+  
+          mv /tmp/postmarketOS-export/microsoft-surface-rt.img /tmp/postmarketOS-export/raspi_1_bullseye+srt.img
+          gzip -f /tmp/postmarketOS-export/raspi_1_bullseye+srt.img # -f follow symbol link	
+          split -b 2000m /tmp/postmarketOS-export/raspi_1_bullseye+srt.img.gz /tmp/postmarketOS-export/raspi_1_bullseye+srt.img.gz.
+
+          # shutdown later to avoid permission issues
+          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout shutdown
           echo exported files:
           ls -lha /tmp/postmarketOS-export/
 
@@ -103,4 +137,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            /tmp/postmarketOS-export/microsoft-surface-rt.img
+            /tmp/postmarketOS-export/raspi_1_bullseye+srt.img.gz.*
