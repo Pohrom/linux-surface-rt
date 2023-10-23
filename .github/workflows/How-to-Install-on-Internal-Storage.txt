@@ -1,0 +1,20 @@
+## Install on eMMC for UEFI
+1.
+Once Raspberry Pi OS has booted from USB. 
+Go to Start menu -> Accessories -> SD Card Copier. 
+Select the USB drive as the "From". 
+Select the eMMC (mine was MBG4GA) as the "To". 
+Check the box that says "New Partition UUIDs". Click Start
+2.
+Edit the startup.nsh (on the eMMC boot partition, that was just copied to) and change the root=/dev/sda2 to root=/dev/mmcblk0p2. Then save.
+3.
+Once the Copy has finished (with no errors), shutdown the Surface RT, remove the USB drive, then power on the Surface RT normally. (do not hold Vol. down)
+
+## Post Install
+If you want to install Raspi OS on eMMC do the steps below after booting from eMMC.
+
+There is only one thing to do after you can see the desktop.
+Open the Terminal and enter sudo raspi-config 
+Choose Advanced Options
+Choose Expand Filesystem
+Now your SD Card / eMMC is writable and can use all of its space.

@@ -9,6 +9,11 @@ jobs:
   create-installer-image:
     runs-on: ubuntu-latest
     steps:
+      # - name: Setup tmate session
+      #   uses: mxschmitt/action-tmate@v3
+      #   with:
+      #     detached: true
+
       - name: Maximize build space
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -16,44 +21,53 @@ jobs:
           sudo rm -rf "/usr/local/share/boost"
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
-      - name: Check cached rootfs
-        id: cache-rootfs
+      - name: Check cached image
+        id: cache-raspios
         uses: actions/cache/restore@v3
         with:
-          path: ~/rootfs.img
-          key: raspi_1_bullseye.img
+          path: ~/raspios.img
+          key: raspios.img
 
-      - name: Download rootfs image
-        if: ${{ steps.cache-rootfs.outputs.cache-hit != 'true' }}
+      - name: Download image
+        if: ${{ steps.cache-raspios.outputs.cache-hit != 'true' }}
         run: |
-          #wget http://localhost:8000/raspi_1_bullseye.img -O ~/rootfs.img
-          wget https://raspi.debian.net/daily/raspi_1_bullseye.img.xz -O ~/rootfs.img.xz
-          unxz ~/rootfs.img.xz
-          true || rm -rf ~/rootfs.img.xz
+          wget https://downloads.raspberrypi.com/raspios_armhf/images/raspios_armhf-2023-10-10/2023-10-10-raspios-bookworm-armhf.img.xz -O ~/raspios.img.xz
+          unxz ~/raspios.img.xz
+          true || rm -rf ~/raspios.img.xz
 
-      - name: Save rootfs cache
+      - name: Cache image
         uses: actions/cache/save@v3
         with:
-          path: ~/rootfs.img
-          key: raspi_1_bullseye.img
+          path: ~/raspios.img
+          key: raspios.img
+
+      - name: Checkout assests
+        uses: actions/checkout@v4
+        with:
+          path: image-build
 
       - name: Checkout kernel source
-        uses: actions/checkout@v3  
+        uses: actions/checkout@v4
+        with:
+          path: kernel
+          repository: Open-Surface-RT/grate-linux
+          ref: microsoft-surface-rt
 
       - name: Load ccache
         uses: actions/cache@v3
         with:
           path: ~/.ccache
-          key: kernel-build
+          key: kernel-ccache
 
-      - name: Build custom kernel
+      - name: Build kernel
         run: |
           sudo apt update
           sudo apt install build-essential gcc-arm-linux-gnueabihf ccache libncurses-dev flex bison libssl-dev bc libelf-dev libudev-dev -y
           mkdir -p ~/.ccache
           ccache -z
+          cd ${GITHUB_WORKSPACE}/kernel
           ARCH=arm make ARCH=arm CC="ccache arm-linux-gnueabihf-gcc" CXX="ccache arm-linux-gnueabihf-g++" tegra_defconfig
-          cat .github/workflows/tegra_surface_rt_defconfig >> .config
+          cat ${GITHUB_WORKSPACE}/image-build/.github/workflows/tegra_surface_rt_defconfig >> .config
           ARCH=arm yes '' | make ARCH=arm CC="ccache arm-linux-gnueabihf-gcc" CXX="ccache arm-linux-gnueabihf-g++" CROSS_COMPILE=arm-linux-gnueabihf- -j $(nproc)
 
       - name: ccache statistics
@@ -65,22 +79,17 @@ jobs:
         id: cache
         with:
           path: ~/.ccache
-          key: kernel-build
+          key: kernel-ccache
 
-      - name: Download grub files
-        run: | 
-          wget https://github.com/makuhlmann/grub-2.04-nokeymod/releases/download/v1-nokeymod/grub.efi -O ~/grub.efi
-          wget https://github.com/makuhlmann/grub-2.04-nokeymod/releases/download/v1-nokeymod/unicode.pf2 -O ~/unicode.pf2
-
-      - name: Patch boot+rootfs image
+      - name: Patch image
         run: |
-          # (Optional) expand rootfs for kmod
+          # expand rootfs for kernel modules
           sudo apt update
           sudo apt install parted -y
-          dd if=/dev/zero bs=1MiB of=~/rootfs.img conv=notrunc oflag=append count=500
+          dd if=/dev/zero bs=1MiB of=~/raspios.img conv=notrunc oflag=append count=500
 
           # mount
-          LOOPDEV="$(sudo losetup -P --show -f ~/rootfs.img)"
+          LOOPDEV="$(sudo losetup -P --show -f ~/raspios.img)"
           sudo parted "${LOOPDEV}" resizepart 2 100%
           sudo resize2fs -f "${LOOPDEV}p2"
 
@@ -89,52 +98,27 @@ jobs:
           sudo mount "${LOOPDEV}p2" /mnt/rootfs
 
           # copy files
-          sudo mkdir -p /mnt/boot/efi/boot
-          sudo cp ~/grub.efi /mnt/boot/efi/boot/bootarm.efi
-          sudo cp ~/unicode.pf2 /mnt/boot
-          sudo cp .github/workflows/grub.cfg /mnt/boot
-          sudo cp arch/arm/boot/zImage /mnt/boot
-          sudo cp arch/arm/boot/dts/tegra30-microsoft-surface-rt-efi.dtb /mnt/boot
+          sudo cp -rf ${GITHUB_WORKSPACE}/image-build/.github/workflows/efi /mnt/boot/
+          sudo cp ${GITHUB_WORKSPACE}/image-build/.github/workflows/startup.nsh /mnt/boot/
+          sudo cp ${GITHUB_WORKSPACE}/image-build/.github/workflows/startup.emmc.nsh /mnt/boot/
+          sudo cp ${GITHUB_WORKSPACE}/image-build/.github/workflows/How-to-Install-on-Internal-Storage.txt /mnt/rootfs/
+          cd ${GITHUB_WORKSPACE}/kernel
+          sudo cp arch/arm/boot/zImage /mnt/boot/
+          sudo cp arch/arm/boot/dts/tegra30-microsoft-surface-rt-efi.dtb /mnt/boot/
           sudo ARCH=arm make INSTALL_MOD_PATH=/mnt/rootfs modules_install
 
           sudo umount /mnt/boot /mnt/rootfs
           sudo resize2fs -fM "${LOOPDEV}p2"
           sudo losetup --detach "${LOOPDEV}"
 
-      - name: Create installer image
+      - name: Split image
         run: |
-          sudo apt update
-          sudo apt install python3-pip -y
-          sudo pip3 install pmbootstrap
-          wget https://www.debian.org/Pics/debian-logo-1024x576.png -O ~/logo.png
-
-          # hack: dont reserve space for sdcard install
-          WHO_RESERVE="$(pip show -f pmbootstrap | awk '/^Location: / { print $2 }')/pmb/install/_install.py"
-          echo "$WHO_RESERVE"
-          sudo sed -i "s/size_reserve =/size_reserve = 1 #/g" "$WHO_RESERVE"
-
-          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout init
-          yes '' | pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout install \
-          --no-base --no-recommends --ondev --no-rootfs --cp \
-          ~/logo.png:/usr/share/calamares/branding/default-mobile/logo.png \
-          ~/rootfs.img:/var/lib/rootfs.img \
-          .github/workflows/mobile.conf:/etc/calamares/modules/mobile.conf \
-          .github/workflows/shellprocess.conf:/etc/calamares/modules/shellprocess.conf
-
-          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout export
-  
-          mv /tmp/postmarketOS-export/microsoft-surface-rt.img /tmp/postmarketOS-export/raspi_1_bullseye+srt.img
-          gzip -f /tmp/postmarketOS-export/raspi_1_bullseye+srt.img # -f follow symbol link	
-          split -b 2000m /tmp/postmarketOS-export/raspi_1_bullseye+srt.img.gz /tmp/postmarketOS-export/raspi_1_bullseye+srt.img.gz.
-
-          # shutdown later to avoid permission issues
-          pmbootstrap -y -c .github/workflows/pmbootstrap.cfg -w ~/pmbootstrap --details-to-stdout shutdown
-          echo exported files:
-          ls -lha /tmp/postmarketOS-export/
+          gzip -f ~/raspios.img
+          split -b 2000m ~/raspios.img.gz ~/raspios.img.gz.
 
       - name: Release
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            /tmp/postmarketOS-export/raspi_1_bullseye+srt.img.gz.*
+            ~/raspios.img.gz.*
